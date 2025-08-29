@@ -1,17 +1,36 @@
 import { Address } from "viem";
-import { entrypointAbi } from "../epV6.abi";
-import {
-  BATCH_BLOCK_RANGE,
-  CONTRACT_ADDRESS,
-  EVENT_NAME,
-  publicClient,
-} from "./config";
+import { BATCH_BLOCK_RANGE, EVENT_NAME, publicClient } from "./config";
 import blockInfoModel from "../model/blockModel";
 import userOpInfo from "../model/eventModel";
+import multiSigAddressesInfo from "../model/multiSigAddresses";
+import { entryPoint06Address, entryPoint06Abi } from "viem/account-abstraction";
 
 export async function getEvents() {
-  const lastProcessed = await getLastProcessedBlock(CONTRACT_ADDRESS);
+  const senders = await multiSigAddressesInfo.find();
+  const senderAddresses = senders.map((s) =>
+    s.address.toLowerCase()
+  ) as `0x${string}`[];
+
+  const MAX_SENDER_FILTER = 256n; // RPC limit for args filters
+  if (!senderAddresses.length) {
+    console.log("⚠️ No addresses to track.");
+    return;
+  }
+
   const currentBlock = await publicClient.getBlockNumber();
+  let lastProcessed = await getLastProcessedBlock(entryPoint06Address);
+
+  // ✅ Initialize if no record exists (DB empty or deleted)
+  if (lastProcessed === 0n) {
+    const safeStart = currentBlock > BATCH_BLOCK_RANGE
+      ? currentBlock - BATCH_BLOCK_RANGE
+      : 0n;
+    console.log(
+      `⚠️ No previous block found. Initializing from block ${safeStart}`
+    );
+    await updateLastProcessedBlock(entryPoint06Address, safeStart);
+    lastProcessed = safeStart;
+  }
 
   if (lastProcessed >= currentBlock) {
     console.log("No historical events to sync.");
@@ -21,7 +40,9 @@ export async function getEvents() {
   let from = lastProcessed + 1n;
   const to = currentBlock;
 
-  console.log(`Syncing from block ${from} to ${to}`);
+  console.log(
+    `Syncing from block ${from} to ${to} for ${senderAddresses.length} senders`
+  );
 
   function sleep(ms: number) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -31,41 +52,54 @@ export async function getEvents() {
     const chunkEnd =
       from + BATCH_BLOCK_RANGE - 1n <= to ? from + BATCH_BLOCK_RANGE - 1n : to;
 
-    console.log(`fetching logs ${from} -> ${chunkEnd}`);
-    const logs = await publicClient.getContractEvents({
-      address: CONTRACT_ADDRESS,
-      abi: entrypointAbi,
-      eventName: EVENT_NAME,
-      args: {
-        sender: "0x136aE0c79327E9Ceed137994E5876259aC5Ca1E3",
-      },
-      fromBlock: from,
-      toBlock: chunkEnd,
-    });
+    console.log(`Fetching logs ${from} -> ${chunkEnd}`);
 
-    if (logs.length) {
-      for (const log of logs) {
-        await saveEvent(log);
-        // update last processed after each log to be conservative
-        await updateLastProcessedBlock(CONTRACT_ADDRESS, log.blockNumber);
+    // 🔥 Break senders into batches of 256
+    const batches = [];
+    for (
+      let i = 0;
+      i < senderAddresses.length;
+      i += Number(MAX_SENDER_FILTER)
+    ) {
+      batches.push(senderAddresses.slice(i, i + Number(MAX_SENDER_FILTER)));
+    }
+
+    for (const batch of batches) {
+      const logs = await publicClient.getContractEvents({
+        address: entryPoint06Address,
+        abi: entryPoint06Abi,
+        eventName: EVENT_NAME,
+        fromBlock: from,
+        toBlock: chunkEnd,
+        args: {
+          sender: batch, // ✅ only up to 256 at a time
+        },
+      });
+
+      if (logs.length) {
+        for (const log of logs) {
+          await saveEvent(log);
+          // update last processed after each log to be conservative
+          await updateLastProcessedBlock(entryPoint06Address, log.blockNumber);
+        }
+      } else {
+        // If no logs in this chunk, still advance lastProcessedBlock to chunkEnd
+        await updateLastProcessedBlock(entryPoint06Address, chunkEnd);
       }
-    } else {
-      // If no logs in this chunk, still advance lastProcessedBlock to chunkEnd to skip
-      await updateLastProcessedBlock(CONTRACT_ADDRESS, chunkEnd);
+
+      await sleep(1000); // small delay to avoid RPC spam
     }
 
     from = chunkEnd + 1n;
-    await sleep(1000);
   }
 
-  console.log("Events sync complete.");
+  console.log("✅ Events sync complete.");
 }
 
 async function updateLastProcessedBlock(
   contractAddress: Address,
-  blockNumberBigInt: BigInt
+  blockNumberBigInt: bigint
 ) {
-  // store as string for safety
   await blockInfoModel.updateOne(
     { contractAddress },
     { contractAddress, lastProcessedBlock: blockNumberBigInt.toString() },
@@ -88,9 +122,9 @@ async function saveEvent(log: {
   try {
     console.log("log", log);
     const item = {
-      userOpHash: log.args.userOpHash, // decoded from topics
-      sender: log.args.sender, // decoded from topics
-      nonce: log.args.nonce?.toString(), // BigInt → String
+      userOpHash: log.args.userOpHash,
+      sender: log.args.sender,
+      nonce: log.args.nonce?.toString(),
       paymaster: log.args.paymaster ?? null,
       blockNumber: log.blockNumber.toString(),
       txHash: log.transactionHash,
