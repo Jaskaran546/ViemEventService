@@ -6,8 +6,7 @@ export const publicClient = createPublicClient({
   chain: baseSepolia,
   transport: http(
     // "https://base-sepolia.api.onfinality.io/public"
-    "https://sepolia.base.org"
-    // "https://base-sepolia.drpc.org"
+    "https://base-sepolia.drpc.org"
   
   ),
 });

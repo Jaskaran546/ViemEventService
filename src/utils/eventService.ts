@@ -8,19 +8,8 @@ import {
 } from "./config";
 import blockInfoModel from "../model/blockModel";
 import userOpInfo from "../model/eventModel";
-import multiSigAddressesInfo from "../model/multiSigAddresses";
 
 export async function getEvents() {
-  const senders = await multiSigAddressesInfo.find();
-  const senderAddresses = senders.map((s) =>
-    s.address.toLowerCase()
-  ) as `0x${string}`[];
-  const MAX_SENDER_FILTER = 256n; // RPC limit for args filters
-  if (!senderAddresses.length) {
-    console.log("⚠️ No addresses to track.");
-    return;
-  }
-
   const lastProcessed = await getLastProcessedBlock(CONTRACT_ADDRESS);
   const currentBlock = await publicClient.getBlockNumber();
 
@@ -32,9 +21,7 @@ export async function getEvents() {
   let from = lastProcessed + 1n;
   const to = currentBlock;
 
-  console.log(
-    `Syncing from block ${from} to ${to} for ${senderAddresses.length} senders`
-  );
+  console.log(`Syncing from block ${from} to ${to}`);
 
   function sleep(ms: number) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -44,48 +31,34 @@ export async function getEvents() {
     const chunkEnd =
       from + BATCH_BLOCK_RANGE - 1n <= to ? from + BATCH_BLOCK_RANGE - 1n : to;
 
-    console.log(`Fetching logs ${from} -> ${chunkEnd}`);
+    console.log(`fetching logs ${from} -> ${chunkEnd}`);
+    const logs = await publicClient.getContractEvents({
+      address: CONTRACT_ADDRESS,
+      abi: entrypointAbi,
+      eventName: EVENT_NAME,
+      args: {
+        sender: "0x136aE0c79327E9Ceed137994E5876259aC5Ca1E3",
+      },
+      fromBlock: from,
+      toBlock: chunkEnd,
+    });
 
-    // 🔥 Break senders into batches of 256
-    const batches = [];
-    for (
-      let i = 0;
-      i < senderAddresses.length;
-      i += Number(MAX_SENDER_FILTER)
-    ) {
-      batches.push(senderAddresses.slice(i, i + Number(MAX_SENDER_FILTER)));
-    }
-
-    for (const batch of batches) {
-      console.log('batch', batch)
-      const logs = await publicClient.getContractEvents({
-        address: CONTRACT_ADDRESS,
-        abi: entrypointAbi,
-        eventName: EVENT_NAME,
-        fromBlock: from,
-        toBlock: chunkEnd,
-        args: {
-          sender: batch, // ✅ only up to 256 at a time
-        },
-      });
-
-      if (logs.length) {
-        for (const log of logs) {
-          await saveEvent(log);
-          // update last processed after each log to be conservative
-          await updateLastProcessedBlock(CONTRACT_ADDRESS, log.blockNumber);
-        }
-      } else {
-        // If no logs in this chunk, still advance lastProcessedBlock to chunkEnd to skip
-        await updateLastProcessedBlock(CONTRACT_ADDRESS, chunkEnd);
+    if (logs.length) {
+      for (const log of logs) {
+        await saveEvent(log);
+        // update last processed after each log to be conservative
+        await updateLastProcessedBlock(CONTRACT_ADDRESS, log.blockNumber);
       }
-
-      from = chunkEnd + 1n;
-      await sleep(1000);
+    } else {
+      // If no logs in this chunk, still advance lastProcessedBlock to chunkEnd to skip
+      await updateLastProcessedBlock(CONTRACT_ADDRESS, chunkEnd);
     }
 
-    console.log("Events sync complete.");
+    from = chunkEnd + 1n;
+    await sleep(1000);
   }
+
+  console.log("Events sync complete.");
 }
 
 async function updateLastProcessedBlock(
